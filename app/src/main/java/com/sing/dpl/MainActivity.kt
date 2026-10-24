@@ -16,7 +16,6 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
 import android.graphics.Paint
-import android.graphics.Path
 import android.graphics.RadialGradient
 import android.graphics.RectF
 import android.graphics.Shader
@@ -39,15 +38,14 @@ import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
-import java.util.Locale
+import java.util.Arrays
 import kotlin.math.abs
-import kotlin.math.cos
 import kotlin.math.min
 import kotlin.math.sin
 import kotlin.random.Random
 
 // ============================================================
-// SPECTRUM — shared visualizer buffer + simulated instruments
+// SPECTRUM — shared visualizer buffer
 // ============================================================
 object Spectrum {
     const val BANDS = 24
@@ -87,13 +85,12 @@ object Spectrum {
 }
 
 // ============================================================
-// INSTRUMENT ENGINE — synthesizes tones that follow the spectrum
+// INSTRUMENT ENGINE — generates tones following spectrum
 // ============================================================
 class InstrumentEngine {
     @Volatile var enabled = true
     @Volatile var mix = 0
     @Volatile var volume = 0.5f
-    private val sampleRate = 44100
     private val handler = Handler(Looper.getMainLooper())
     private val voices = ArrayList<Voice>()
     private var running = false
@@ -137,19 +134,18 @@ class InstrumentEngine {
             for (i in 0 until count) {
                 if (voices.size > 24) break
                 val f = baseFreqs[rnd.nextInt(baseFreqs.size)]
-                val wave = mix
-                voices.add(Voice(f, wave, 0.9f, 0f, 0.05f + avg * 0.4f))
+                voices.add(Voice(f, mix, 0.9f, 0f, 0.05f + avg * 0.4f))
             }
         }
     }
 
     fun render(buffer: ShortArray, count: Int) {
         if (!enabled) {
-            java.util.Arrays.fill(buffer, 0, count, 0)
+            Arrays.fill(buffer, 0, count, 0)
             return
         }
         val vol = volume
-        val dt = count.toFloat() / sampleRate
+        val dt = count.toFloat() / 44100f
         synchronized(voices) {
             val iter = voices.iterator()
             while (iter.hasNext()) {
@@ -157,11 +153,11 @@ class InstrumentEngine {
                 v.life -= dt * 1.8f
                 if (v.life <= 0f) { iter.remove(); continue }
                 val w = when (v.wave) {
-                    0 -> sinPhase(v, "sine")
-                    1 -> sinPhase(v, "saw")
-                    2 -> sinPhase(v, "pluck")
-                    3 -> sinPhase(v, "square")
-                    else -> sinPhase(v, "synth")
+                    0 -> sin(v.phase.toDouble()).toFloat()
+                    1 -> (v.phase / Math.PI.toFloat()) - 1f
+                    2 -> ((1f - v.life).coerceIn(0f, 1f) * sin(v.phase.toDouble() * (1f + v.life * 3f))).toFloat()
+                    3 -> if (sin(v.phase.toDouble()) >= 0) 0.7f else -0.7f
+                    else -> (sin(v.phase.toDouble()) * 0.7 + sin(v.phase.toDouble() * 2.0) * 0.3).toFloat()
                 }
                 v.amp *= (1f - dt * 0.6f)
                 val s = (w * v.amp * vol * Short.MAX_VALUE).toInt()
@@ -169,43 +165,19 @@ class InstrumentEngine {
                 if (count > 1) {
                     buffer[count - 2] = (buffer[count - 2].toInt() + s / 8).toInt().coerceIn(-32767, 32767).toShort()
                 }
-            }
-        }
-        val dtStep = 2.0 * Math.PI / sampleRate
-        synchronized(voices) {
-            for (v in voices) {
+                val dtStep = 2.0 * Math.PI / 44100.0
                 v.phase += dtStep.toFloat() * v.freq
                 if (v.phase > Math.PI.toFloat() * 2) v.phase -= (Math.PI.toFloat() * 2)
             }
         }
     }
-
-    private fun sinPhase(v: Voice, kind: String): Float {
-        val p = v.phase
-        return when (kind) {
-            "sine" -> sin(p.toDouble()).toFloat()
-            "saw" -> (p / Math.PI.toFloat()) - 1f
-            "pluck" -> ((1f - v.life).coerceIn(0f, 1f) * sin(p.toDouble() * (1f + v.life * 3f))).toFloat()
-            "square" -> if (sin(p.toDouble()) >= 0) 0.7f else -0.7f
-            else -> (sin(p.toDouble()) * 0.7 + sin(p.toDouble() * 2.0) * 0.3).toFloat()
-        }
-    }
-
-    fun noteName(idx: Int): String = when (idx) {
-        0 -> "PIANO"
-        1 -> "GUITAR"
-        2 -> "OUD"
-        3 -> "VIOLIN"
-        else -> "SYNTH"
-    }
 }
 
 // ============================================================
-// VISUALIZER CANVAS — spectrum bars + floating instruments
+// VISUALIZER CANVAS
 // ============================================================
 class SpectrumView(context: Context) : View(context) {
     private val barPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val orbPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -216,9 +188,6 @@ class SpectrumView(context: Context) : View(context) {
 
     init {
         barPaint.style = Paint.Style.FILL
-        glowPaint.style = Paint.Style.FILL
-        labelPaint.color = Color.parseColor("#8899AA")
-        labelPaint.textSize = 22f
         labelPaint.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
         labelPaint.textAlign = Paint.Align.CENTER
         orbPaint.style = Paint.Style.FILL
@@ -316,7 +285,7 @@ class SpectrumView(context: Context) : View(context) {
 }
 
 // ============================================================
-// SYNTH RECEIVER — broadcast between service & UI
+// SYNTH RECEIVER
 // ============================================================
 class SynthReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
@@ -329,14 +298,12 @@ class SynthReceiver : BroadcastReceiver() {
 }
 
 // ============================================================
-// SYNTH SERVICE — wraps playback + visualizer + synth engine
+// SYNTH SERVICE
 // ============================================================
 class MusicSynthService : Service() {
     private var mediaPlayer: MediaPlayer? = null
     private var visualizer: Visualizer? = null
     private var engine: InstrumentEngine? = null
-    private var trackUri: Uri? = null
-    private val handler = Handler(Looper.getMainLooper())
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -375,8 +342,7 @@ class MusicSynthService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         intent?.getStringExtra("uri")?.let { uriStr ->
-            trackUri = Uri.parse(uriStr)
-            startPlayback(trackUri!!)
+            startPlayback(Uri.parse(uriStr))
         }
         intent?.getIntExtra("mix", -1)?.let { if (it >= 0) setMix(it) }
         intent?.getFloatExtra("volume", -1f)?.let { if (it >= 0) setVolume(it) }
@@ -404,8 +370,7 @@ class MusicSynthService : Service() {
                         override fun onWaveFormDataCapture(v: Visualizer?, data: ByteArray?, rate: Int) {
                             if (data != null) Spectrum.push(data)
                         }
-                        override fun onFftDataCapture(v: Visualizer?, fft: ByteArray?, rate: Int) {
-                        }
+                        override fun onFftDataCapture(v: Visualizer?, fft: ByteArray?, rate: Int) {}
                     },
                     Visualizer.getMaxCaptureRate() / 2,
                     true,
@@ -415,9 +380,7 @@ class MusicSynthService : Service() {
             }
             broadcastState()
         } catch (e: Exception) {
-            handler.post {
-                Toast.makeText(applicationContext, "تعذر تشغيل الملف", Toast.LENGTH_LONG).show()
-            }
+            Toast.makeText(applicationContext, "تعذر تشغيل الملف", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -431,8 +394,7 @@ class MusicSynthService : Service() {
     }
 
     fun setMix(idx: Int) {
-        val e = engine ?: return
-        e.mix = idx
+        engine?.mix = idx
         Spectrum.instrumentMix = idx
         broadcastState()
     }
@@ -456,7 +418,7 @@ class MusicSynthService : Service() {
 }
 
 // ============================================================
-// MAIN ACTIVITY — luxury UI
+// MAIN ACTIVITY
 // ============================================================
 class MainActivity : Activity() {
     private val REQ_AUDIO = 7001
@@ -519,7 +481,7 @@ class MainActivity : Activity() {
             if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
                 statusTxt.text = "اختر أغنية للبدء"
             } else {
-                statusTxt.text = "الصلاحية مرفوضة — يمكنك اختيار ملف مباشرة من المستكشف"
+                statusTxt.text = "الصلاحية مرفوضة — يمكنك اختيار ملف مباشرة"
             }
         }
     }
@@ -597,9 +559,7 @@ class MainActivity : Activity() {
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).also {
                     it.marginEnd = dp(4)
                 }
-                setOnClickListener {
-                    selectInstrument(idx)
-                }
+                setOnClickListener { selectInstrument(idx) }
             }
             buttons.add(b)
             instrumentsRow.addView(b)
@@ -651,7 +611,6 @@ class MainActivity : Activity() {
         pickBtn = Button(this).apply {
             text = "اختر أغنية 🎵"
             setTextColor(DEEP_BG)
-            setBackgroundColor(GOLD)
             textSize = 14f
             typeface = Typeface.create(Typeface.SERIF, Typeface.BOLD)
             background = rounded(GOLD, 12)
